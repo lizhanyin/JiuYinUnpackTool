@@ -9,7 +9,11 @@
 //!      字符串（≥300 字节）作为启发式候选，最终由 Lua undump 校验把关。
 
 use anyhow::{bail, Context, Result};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+/// 索引加密密钥表的默认文件名（`--keys` 未指定时按 exe 目录与当前目录探测）。
+pub const KEY_TABLE_FILENAME: &str = "jiuyin-keys.txt";
 
 /// 密钥开头的 16 字节签名锚点（完整密钥从启动器文件中读出）。
 pub const KEY_SIGNATURE: &[u8] = b"abcd464fghfgfjhf";
@@ -110,6 +114,87 @@ pub fn find_launcher(anchor: &Path) -> Option<PathBuf> {
             }
         }
         base = base.parent()?;
+    }
+    None
+}
+
+// ---------- 索引加密密钥表 ----------
+
+/// 解析密钥表文本：每行 `密钥ID=hex`（ID 为 1..4 位十六进制，# 开头为注释）。
+///
+/// 示例：
+/// ```text
+/// # 2026-11 客户端提取
+/// 4A3C=23aa67753dd5...
+/// A3C8=a6abf68c...
+/// ```
+/// 返回 密钥ID -> 循环 XOR 密钥字节串。
+pub fn parse_key_table(text: &str) -> Result<HashMap<u16, Vec<u8>>> {
+    let mut table = HashMap::new();
+    for (lineno, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((id_s, hex_s)) = line.split_once('=') else {
+            bail!("密钥表第 {} 行缺少 '='：{:?}", lineno + 1, line);
+        };
+        let id = u16::from_str_radix(id_s.trim(), 16)
+            .with_context(|| format!("密钥表第 {} 行密钥 ID 非法：{:?}", lineno + 1, id_s))?;
+        let hex_s = hex_s.trim();
+        if hex_s.len() % 2 != 0 || !hex_s.chars().all(|c| c.is_ascii_hexdigit()) {
+            bail!(
+                "密钥表第 {} 行密钥 hex 非法（长度 {:?}）",
+                lineno + 1,
+                hex_s.len()
+            );
+        }
+        let mut key = Vec::with_capacity(hex_s.len() / 2);
+        let b = hex_s.as_bytes();
+        for i in (0..b.len()).step_by(2) {
+            let hi = (b[i] as char).to_digit(16).unwrap() as u8;
+            let lo = (b[i + 1] as char).to_digit(16).unwrap() as u8;
+            key.push(hi << 4 | lo);
+        }
+        if id_s.trim().len() > 4 || key.len() < 8 {
+            bail!(
+                "密钥表第 {} 行异常：ID 超范围或密钥过短（{} 字节）",
+                lineno + 1,
+                key.len()
+            );
+        }
+        table.insert(id, key);
+    }
+    if table.is_empty() {
+        bail!("密钥表为空（无有效条目）");
+    }
+    Ok(table)
+}
+
+/// 加载密钥表文件。
+pub fn load_key_table(path: &Path) -> Result<HashMap<u16, Vec<u8>>> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("读取密钥表 {} 失败", path.display()))?;
+    parse_key_table(&text).with_context(|| format!("解析密钥表 {} 失败", path.display()))
+}
+
+/// 定位密钥表：--keys 显式路径优先，其次 exe 所在目录、当前目录下的
+/// `jiuyin-keys.txt`。返回 (路径, 是否显式指定)。
+pub fn find_key_table(explicit: Option<&Path>) -> Option<(PathBuf, bool)> {
+    if let Some(p) = explicit {
+        return Some((p.to_path_buf(), true));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let cand = dir.join(KEY_TABLE_FILENAME);
+            if cand.is_file() {
+                return Some((cand, false));
+            }
+        }
+    }
+    let cand = PathBuf::from(KEY_TABLE_FILENAME);
+    if cand.is_file() {
+        return Some((cand, false));
     }
     None
 }

@@ -1,3 +1,7 @@
 /target
 /test_out
 /.zcode
+
+# 游戏资源样本与 Python 缓存，不入库
+/res/
+analysis/__pycache__/

@@ -3,11 +3,15 @@
 //! 头部 19 字节，条目区从 0x13 连续排列，数据块为逐条目独立的标准 zlib 流：
 //!
 //! ```text
-//! 头部:  "PCK0" | u16 版本=15 | u16 保留 | u32 保留 | u32 条目数
+//! 头部:  "PCK0" | u16 版本=15 | u16 标志 | u16 密钥ID | u32 条目数
 //!        | u32 索引结束偏移(=数据区起点) | u8 0
 //! 条目:  u16 记录总长 | u64 数据偏移 | u32 原始大小 | u32 压缩大小
 //!        | 7B 时间戳 | u16 扩展 | NUL 结尾 GBK 文件名 [ | NUL 结尾目标包名 ]
 //! ```
+//!
+//! 标志 0 = 明文索引；标志 4 = 索引区（0x13..索引结束偏移）被逐字节循环
+//! XOR 加密，密钥长度不定（实测 24..251 字节），头部 0x08 处的 u16 为密钥
+//! ID（同批更新的包共享同一密钥/ID）。数据块不受影响，仍为明文 zlib。
 //!
 //! 扩展字段在普通 .package 中恒为 0；在 .patch 中为 0（散文件）或
 //! `strlen(文件名)+1`（其后跟随目标包名字符串）。
@@ -20,13 +24,16 @@ pub const MAGIC: &[u8; 4] = b"PCK0";
 pub const HEADER_SIZE: usize = 0x13;
 pub const ENTRY_FIXED_SIZE: usize = 27;
 pub const SUPPORTED_VERSION: u16 = 15;
+/// 头部 0x06 处标志值：索引区整体循环 XOR 加密。
+pub const FLAG_INDEX_ENCRYPTED: u16 = 4;
 
 #[derive(Debug, Clone)]
 pub struct Header {
     pub version: u16,
-    /// 头部 0x06 处的标志字：0 = 明文索引（旧格式）；
-    /// 4 = 索引区整体加密（2026-05 起的新补丁格式，暂不支持）。
+    /// 头部 0x06 处的标志字：0 = 明文索引；4 = 索引区整体加密。
     pub flags: u16,
+    /// 头部 0x08 处的 u16：明文格式恒 0；加密格式为密钥 ID。
+    pub key_id: u16,
     pub entry_count: u32,
     /// 索引区结束偏移，同时是数据区起点。
     pub index_end: u64,
@@ -63,8 +70,20 @@ pub struct Package {
     pub entries: Vec<Entry>,
 }
 
-/// 从 reader（已打开的 .package/.patch 文件）解析头部与全部条目。
-pub fn parse<R: Read>(mut reader: R, file_len: u64) -> Result<Package> {
+/// 从 reader（已打开的 .package/.patch 文件）解析头部与全部条目（明文索引格式）。
+pub fn parse<R: Read>(reader: R, file_len: u64) -> Result<Package> {
+    parse_with_key(reader, file_len, None)
+}
+
+/// 解析头部与全部条目；`index_key` 为索引加密格式（标志 4）的循环 XOR 密钥。
+///
+/// 密钥按 `key[i % key.len()]` 与索引区逐字节异或；头部本身（含密钥 ID）不加密。
+/// 标志 4 但未提供密钥时报错并给出密钥 ID，供 `--keys` 密钥表查用。
+pub fn parse_with_key<R: Read>(
+    mut reader: R,
+    file_len: u64,
+    index_key: Option<&[u8]>,
+) -> Result<Package> {
     let mut head = [0u8; HEADER_SIZE];
     reader
         .read_exact(&mut head)
@@ -79,17 +98,22 @@ pub fn parse<R: Read>(mut reader: R, file_len: u64) -> Result<Package> {
     let header = Header {
         version: u16::from_le_bytes([head[4], head[5]]),
         flags: u16::from_le_bytes([head[6], head[7]]),
+        key_id: u16::from_le_bytes([head[8], head[9]]),
         entry_count: u32::from_le_bytes([head[0x0A], head[0x0B], head[0x0C], head[0x0D]]),
         index_end: u32::from_le_bytes([head[0x0E], head[0x0F], head[0x10], head[0x11]]) as u64,
     };
     if header.version != SUPPORTED_VERSION {
         bail!("不支持的 PCK0 版本 {}（仅支持 15）", header.version);
     }
-    if header.flags != 0 {
+    if header.flags == FLAG_INDEX_ENCRYPTED && index_key.is_none() {
         bail!(
-            "该包使用索引加密的新格式（头部标志 = {}，明文索引格式标志为 0），暂不支持",
-            header.flags
+            "该包使用索引加密格式（密钥 ID 0x{:04X}）：请通过 --keys 提供密钥表\
+             （含该 ID 的条目），或使用密钥表中的对应密钥",
+            header.key_id
         );
+    }
+    if header.flags != 0 && header.flags != FLAG_INDEX_ENCRYPTED {
+        bail!("未知头部标志 {}（支持 0 = 明文 / 4 = 索引加密）", header.flags);
     }
     if header.index_end < HEADER_SIZE as u64 || header.index_end > file_len {
         bail!(
@@ -104,6 +128,15 @@ pub fn parse<R: Read>(mut reader: R, file_len: u64) -> Result<Package> {
     reader
         .read_exact(&mut index)
         .context("读取索引区失败")?;
+    if header.flags == FLAG_INDEX_ENCRYPTED {
+        let key = index_key.unwrap();
+        if key.is_empty() {
+            bail!("索引密钥为空（密钥 ID 0x{:04X}）", header.key_id);
+        }
+        for (i, b) in index.iter_mut().enumerate() {
+            *b ^= key[i % key.len()];
+        }
+    }
 
     let mut entries = Vec::with_capacity(header.entry_count as usize);
     let mut pos = 0usize;

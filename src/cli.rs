@@ -30,6 +30,11 @@ pub struct Args {
     #[arg(short, long, value_name = "EXE")]
     pub launcher: Option<PathBuf>,
 
+    /// 索引加密格式（标志 4）的密钥表文件，每行 "ID=hex"
+    /// （默认探测 exe 目录/当前目录下的 jiuyin-keys.txt）
+    #[arg(long, value_name = "FILE")]
+    pub keys: Option<PathBuf>,
+
     /// 仅列出包内条目，不解包
     #[arg(long)]
     pub list: bool,

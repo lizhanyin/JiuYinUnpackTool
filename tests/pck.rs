@@ -84,11 +84,66 @@ fn reject_bad_magic() {
 
 #[test]
 fn reject_encrypted_index_flag() {
-    // 头部 0x06 标志非 0（新补丁的索引加密格式）应被明确拒绝。
-    let mut buf = build_pkg(&[(0, 1, 1, "a", None)]);
-    buf[6] = 4;
+    // 标志 4 且未提供密钥：应报错并给出密钥 ID（供 --keys 密钥表查用）。
+    let buf = build_pkg(&[(0, 1, 1, "a", None)]);
+    let buf = encrypt_pkg(buf, 0x4A3C, &[7u8; 60]);
     let err = pck::parse(&buf[..], buf.len() as u64).unwrap_err().to_string();
     assert!(err.contains("索引加密"), "实际错误：{err}");
+    assert!(err.contains("0x4A3C"), "应包含密钥 ID：{err}");
+}
+
+/// 将明文包改造为索引加密格式（标志 4）：头部写标志与密钥 ID，索引区循环 XOR。
+fn encrypt_pkg(mut buf: Vec<u8>, key_id: u16, key: &[u8]) -> Vec<u8> {
+    let index_end = u32::from_le_bytes([buf[0x0E], buf[0x0F], buf[0x10], buf[0x11]]) as usize;
+    buf[6..8].copy_from_slice(&pck::FLAG_INDEX_ENCRYPTED.to_le_bytes());
+    buf[8..10].copy_from_slice(&key_id.to_le_bytes());
+    for i in pck::HEADER_SIZE..index_end {
+        buf[i] ^= key[(i - pck::HEADER_SIZE) % key.len()];
+    }
+    buf
+}
+
+#[test]
+fn encrypted_index_roundtrip() {
+    // 真实格式特征：60 字节循环 XOR 密钥（同 ini.package 实测），头部 ID 0x4A3C。
+    let key: Vec<u8> = (0..60).map(|i| (i * 37 + 11) as u8).collect();
+    let entries: Vec<(u64, u32, u32, &str, Option<&str>)> = vec![
+        (0x1E5AEC, 63, 61, "res\\ini\\npc\\fbmac031006.ini", None),
+        (0x425347, 66, 54, "res\\ini\\npc\\npcitem856.ini", None),
+    ];
+    let plain = build_pkg(&entries);
+    let enc = encrypt_pkg(plain.clone(), 0x4A3C, &key);
+
+    let pkg = pck::parse_with_key(&enc[..], enc.len() as u64, Some(&key)).unwrap();
+    assert_eq!(pkg.header.flags, pck::FLAG_INDEX_ENCRYPTED);
+    assert_eq!(pkg.header.key_id, 0x4A3C);
+    assert_eq!(pkg.entries.len(), 2);
+    assert_eq!(pkg.entries[0].name, "res\\ini\\npc\\fbmac031006.ini");
+    assert_eq!(pkg.entries[0].raw_size, 63);
+    assert_eq!(pkg.entries[1].data_offset, 0x425347);
+    // 与明文包逐条目一致（密钥长度 60 不是索引长度的因子，覆盖跨周期场景）。
+    let plain_pkg = pck::parse(&plain[..], plain.len() as u64).unwrap();
+    for (a, b) in pkg.entries.iter().zip(plain_pkg.entries.iter()) {
+        assert_eq!(a.name, b.name);
+        assert_eq!(a.data_offset, b.data_offset);
+        assert_eq!(a.raw_size, b.raw_size);
+        assert_eq!(a.comp_size, b.comp_size);
+    }
+}
+
+#[test]
+fn encrypted_index_wrong_key_fails() {
+    let key = [9u8; 200]; // eff/icon 实测 200 字节密钥长度
+    let wrong = [8u8; 200];
+    let enc =
+        encrypt_pkg(build_pkg(&[(0x188BE, 3754, 1051, "res\\eff\\x.c", None)]), 0xA3C8, &key);
+    let err = pck::parse_with_key(&enc[..], enc.len() as u64, Some(&wrong)).unwrap_err();
+    // 错误密钥必然破坏 u16 记录长度或 NUL 结构，解析应当失败而非返回垃圾。
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("记录长度非法") || msg.contains("NUL") || msg.contains("条目数不符"),
+        "实际错误：{msg}"
+    );
 }
 
 #[test]

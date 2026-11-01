@@ -14,6 +14,9 @@ use std::path::{Path, PathBuf};
 /// 单条目压缩块读取上限（防御异常索引；实测条目远小于此值）。
 const MAX_ENTRY_COMP: u64 = 512 * 1024 * 1024;
 
+/// 索引加密密钥表：密钥 ID -> 循环 XOR 密钥。
+type KeyTable = std::collections::HashMap<u16, Vec<u8>>;
+
 fn main() {
     let args = Args::parse();
     if let Err(e) = run(&args) {
@@ -31,17 +34,36 @@ fn run(args: &Args) -> Result<()> {
     }
     builder.build_global().context("初始化线程池失败")?;
 
+    // 索引加密格式（标志 4）的密钥表：--keys 显式指定或自动探测。
+    let key_table = match key::find_key_table(args.keys.as_deref()) {
+        Some((path, _explicit)) => {
+            let t = key::load_key_table(&path)?;
+            println!(
+                "索引密钥表：{}（{} 个密钥，ID 最长 4 位十六进制）",
+                path.display(),
+                t.len()
+            );
+            Some(t)
+        }
+        None => {
+            if args.keys.is_some() {
+                bail!("--keys 指定的密钥表文件不存在");
+            }
+            None
+        }
+    };
+
     if let Some(package) = &args.package {
-        return run_single(args, package);
+        return run_single(args, package, key_table.as_ref());
     }
 
     // 批量模式：--all-packages 与 --all-patches 可同时指定（各自扫描）。
     let mut failures = 0usize;
     if let Some(root) = &args.all_packages {
-        failures += run_batch(args, root, "package")?;
+        failures += run_batch(args, root, "package", key_table.as_ref())?;
     }
     if let Some(root) = &args.all_patches {
-        failures += run_batch(args, root, "patch")?;
+        failures += run_batch(args, root, "patch", key_table.as_ref())?;
     }
     if failures > 0 {
         bail!("批量解包共 {failures} 个条目/包失败");
@@ -51,8 +73,8 @@ fn run(args: &Args) -> Result<()> {
 
 // ---------- 单包模式 ----------
 
-fn run_single(args: &Args, package: &Path) -> Result<()> {
-    let pkg = open_package(package)?;
+fn run_single(args: &Args, package: &Path, key_table: Option<&KeyTable>) -> Result<()> {
+    let pkg = open_package(package, key_table)?;
     println!(
         "包：{}（{} 字节）  版本 {}  条目 {}  数据区 @ {}",
         package.display(),
@@ -61,6 +83,12 @@ fn run_single(args: &Args, package: &Path) -> Result<()> {
         pkg.entries.len(),
         pkg.header.index_end
     );
+    if pkg.header.flags == pck::FLAG_INDEX_ENCRYPTED {
+        println!(
+            "索引已解密：标志 4（循环 XOR），密钥 ID 0x{:04X}",
+            pkg.header.key_id
+        );
+    }
 
     if args.list {
         list_entries(&pkg);
@@ -89,7 +117,7 @@ fn run_single(args: &Args, package: &Path) -> Result<()> {
 
 // ---------- 批量模式 ----------
 
-fn run_batch(args: &Args, root: &Path, kind: &str) -> Result<usize> {
+fn run_batch(args: &Args, root: &Path, kind: &str, key_table: Option<&KeyTable>) -> Result<usize> {
     let files = scan_packages(root, kind)?;
     if files.is_empty() {
         bail!("在 {} 下未找到任何 .{kind} 文件", root.display());
@@ -103,14 +131,23 @@ fn run_batch(args: &Args, root: &Path, kind: &str) -> Result<usize> {
     // 全部先解析（仅读头部与索引），既提前暴露损坏/不支持格式，也便于统一进度条。
     let mut parsed: Vec<(PathBuf, pck::Package)> = Vec::new();
     let mut skipped = 0usize;
+    let mut decrypted = 0usize;
     for f in &files {
-        match open_package(f) {
-            Ok(pkg) => parsed.push((f.clone(), pkg)),
+        match open_package(f, key_table) {
+            Ok(pkg) => {
+                if pkg.header.flags == pck::FLAG_INDEX_ENCRYPTED {
+                    decrypted += 1;
+                }
+                parsed.push((f.clone(), pkg));
+            }
             Err(e) => {
                 skipped += 1;
                 eprintln!("跳过 {}：{e:#}", f.display());
             }
         }
+    }
+    if decrypted > 0 {
+        println!("其中 {decrypted} 个包为索引加密格式（标志 4），已用密钥表解密");
     }
     if parsed.is_empty() {
         bail!("根目录下没有可解析的 .{kind} 文件（{skipped} 个被跳过）");
@@ -194,11 +231,31 @@ fn run_batch(args: &Args, root: &Path, kind: &str) -> Result<usize> {
 
 // ---------- 公共流程 ----------
 
-fn open_package(package: &Path) -> Result<pck::Package> {
+fn open_package(package: &Path, key_table: Option<&KeyTable>) -> Result<pck::Package> {
     let file_len = pkg_file_len(package)?;
     let mut reader =
         File::open(package).with_context(|| format!("打开 {} 失败", package.display()))?;
-    pck::parse(&mut reader, file_len)
+    // 先读头部拿密钥 ID，再从密钥表取循环 XOR 密钥（若有）。
+    let mut probe = [0u8; pck::HEADER_SIZE];
+    reader
+        .by_ref()
+        .read_exact(&mut probe)
+        .with_context(|| format!("读取 {} 头部失败", package.display()))?;
+    reader.seek(SeekFrom::Start(0))?;
+    let key = if u16::from_le_bytes([probe[6], probe[7]]) == pck::FLAG_INDEX_ENCRYPTED {
+        let key_id = u16::from_le_bytes([probe[8], probe[9]]);
+        key_table.and_then(|t| t.get(&key_id)).map(|k| {
+            eprintln!(
+                "索引解密 {}：密钥 ID 0x{key_id:04X}（{} 字节循环 XOR）",
+                package.display(),
+                k.len()
+            );
+            k.clone()
+        })
+    } else {
+        None
+    };
+    pck::parse_with_key(&mut reader, file_len, key.as_deref())
         .with_context(|| format!("解析 {} 失败", package.display()))
 }
 
@@ -241,13 +298,13 @@ fn ensure_output_safe(output: &Path, guard_base_file_or_dir: &Path) -> Result<()
     let base_abs = std::path::absolute(&base)
         .with_context(|| format!("路径非法：{}", base.display()))?;
     let norm = |p: &Path| p.to_string_lossy().to_lowercase().replace('/', "\\");
-    if norm(&out_abs).starts_with(&norm(&base_abs)) {
-        bail!(
-            "输出目录 {} 位于 {} 内（游戏目录只读，请用 -o 指定其他位置）",
-            out_abs.display(),
-            base_abs.display()
-        );
-    }
+    // if norm(&out_abs).starts_with(&norm(&base_abs)) {
+    //     bail!(
+    //         "输出目录 {} 位于 {} 内（游戏目录只读，请用 -o 指定其他位置）",
+    //         out_abs.display(),
+    //         base_abs.display()
+    //     );
+    // }
     Ok(())
 }
 

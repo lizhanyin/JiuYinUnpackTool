@@ -59,6 +59,7 @@ fn mode_validation() {
         all_patches: None,
         output: None,
         launcher: None,
+        keys: None,
         list: false,
         no_lua_decrypt: false,
         jobs: None,

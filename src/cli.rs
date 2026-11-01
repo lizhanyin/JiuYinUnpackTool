@@ -43,6 +43,14 @@ pub struct Args {
     #[arg(long)]
     pub no_lua_decrypt: bool,
 
+    /// 反编译解密后的 Lua 字节码为源码（需 java 与 unluac.jar）
+    #[arg(long)]
+    pub decompile: bool,
+
+    /// unluac.jar 路径（--decompile 用；默认探测 exe/当前/tools 目录）
+    #[arg(long, value_name = "FILE")]
+    pub unluac: Option<PathBuf>,
+
     /// 并行线程数（默认：CPU 核数）
     #[arg(short, long, value_name = "N")]
     pub jobs: Option<usize>,
@@ -56,6 +64,9 @@ pub fn validate_modes(args: &Args) -> Result<()> {
     }
     if args.package.is_some() && has_batch {
         bail!("<PACKAGE> 不能与 --all-packages/--all-patches 同时使用");
+    }
+    if args.decompile && args.no_lua_decrypt {
+        bail!("--decompile 需要 Lua 解密（与 --no-lua-decrypt 互斥）");
     }
     Ok(())
 }

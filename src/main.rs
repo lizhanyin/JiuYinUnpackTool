@@ -17,6 +17,55 @@ const MAX_ENTRY_COMP: u64 = 512 * 1024 * 1024;
 /// 索引加密密钥表：密钥 ID -> 循环 XOR 密钥。
 type KeyTable = std::collections::HashMap<u16, Vec<u8>>;
 
+/// unluac 反编译器（java -jar unluac.jar <file>，一次一个文件）。
+#[derive(Clone)]
+struct Decompiler {
+    jar: PathBuf,
+}
+
+/// 解析 --decompile 所需的 java 与 unluac.jar。失败给出可操作的错误。
+fn resolve_decompiler(explicit: Option<&Path>) -> Result<Decompiler> {
+    // unluac.jar：--unluac 显式路径优先，其次 exe 目录 / 当前目录 / ./tools
+    let mut jar = match explicit {
+        Some(p) => {
+            if !p.is_file() {
+                bail!("--unluac 指定的文件不存在：{}", p.display());
+            }
+            p.to_path_buf()
+        }
+        None => {
+            let mut cands: Vec<PathBuf> = Vec::new();
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(dir) = exe.parent() {
+                    cands.push(dir.join("unluac.jar"));
+                    cands.push(dir.join("tools").join("unluac").join("unluac.jar"));
+                }
+            }
+            cands.push(PathBuf::from("unluac.jar"));
+            cands.push(PathBuf::from("tools").join("unluac").join("unluac.jar"));
+            match cands.into_iter().find(|p| p.is_file()) {
+                Some(p) => p,
+                None => bail!(
+                    "未找到 unluac.jar：请用 --unluac 指定，或放到 exe 目录 / 当前目录 / tools/unluac/ 下"
+                ),
+            }
+        }
+    };
+    jar = std::fs::canonicalize(&jar).unwrap_or(jar);
+    // java：PATH 中可用性检查
+    let status = std::process::Command::new("java")
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        _ => bail!("--decompile 需要 java：当前环境 PATH 中未找到可运行的 java"),
+    }
+    println!("反编译器：unluac（{}）", jar.display());
+    Ok(Decompiler { jar })
+}
+
 fn main() {
     let args = Args::parse();
     if let Err(e) = run(&args) {
@@ -59,11 +108,26 @@ fn run(args: &Args) -> Result<()> {
 
     // 批量模式：--all-packages 与 --all-patches 可同时指定（各自扫描）。
     let mut failures = 0usize;
+    let mut all_lua: Vec<PathBuf> = Vec::new();
+    let decompiler = if args.decompile {
+        Some(resolve_decompiler(args.unluac.as_deref())?)
+    } else {
+        None
+    };
     if let Some(root) = &args.all_packages {
-        failures += run_batch(args, root, "package", key_table.as_ref())?;
+        let (f, lua) = run_batch(args, root, "package", key_table.as_ref())?;
+        failures += f;
+        all_lua.extend(lua);
     }
     if let Some(root) = &args.all_patches {
-        failures += run_batch(args, root, "patch", key_table.as_ref())?;
+        let (f, lua) = run_batch(args, root, "patch", key_table.as_ref())?;
+        failures += f;
+        all_lua.extend(lua);
+    }
+    if let Some(dec) = &decompiler {
+        if !all_lua.is_empty() {
+            decompile_all(&all_lua, dec)?;
+        }
     }
     if failures > 0 {
         bail!("批量解包共 {failures} 个条目/包失败");
@@ -112,12 +176,16 @@ fn run_single(args: &Args, package: &Path, key_table: Option<&KeyTable>) -> Resu
         print_errors(&summary);
         bail!("有 {} 个条目解包失败", summary.errors.len());
     }
+    if args.decompile {
+        let dec = resolve_decompiler(args.unluac.as_deref())?;
+        decompile_all(&summary.lua_files, &dec)?;
+    }
     Ok(())
 }
 
 // ---------- 批量模式 ----------
 
-fn run_batch(args: &Args, root: &Path, kind: &str, key_table: Option<&KeyTable>) -> Result<usize> {
+fn run_batch(args: &Args, root: &Path, kind: &str, key_table: Option<&KeyTable>) -> Result<(usize, Vec<PathBuf>)> {
     let files = scan_packages(root, kind)?;
     if files.is_empty() {
         bail!("在 {} 下未找到任何 .{kind} 文件", root.display());
@@ -164,7 +232,7 @@ fn run_batch(args: &Args, root: &Path, kind: &str, key_table: Option<&KeyTable>)
             );
             list_entries(pkg);
         }
-        return Ok(0);
+        return Ok((0, Vec::new()));
     }
 
     let output = args
@@ -181,12 +249,13 @@ fn run_batch(args: &Args, root: &Path, kind: &str, key_table: Option<&KeyTable>)
     let mut total_failures = 0usize;
     let mut total_bytes = 0u64;
     let mut total_lua = 0usize;
+    let mut all_lua: Vec<PathBuf> = Vec::new();
     for (i, (path, pkg)) in parsed.iter().enumerate() {
         // 按包在安装目录下的相对路径分目录，避免 updater/ 与 updater_/ 等同名包互相覆盖。
         let rel = path.strip_prefix(root).unwrap_or(path.as_path());
         let dest = pck::safe_output_path(&output, &rel.to_string_lossy());
         let prefix = format!("[{}/{}] ", i + 1, parsed.len());
-        let summary = match extract_all(&pb, &prefix, path, pkg, &dest, lua_key.as_deref()) {
+        let mut summary = match extract_all(&pb, &prefix, path, pkg, &dest, lua_key.as_deref()) {
             Ok(s) => s,
             Err(e) => {
                 pb.suspend(|| eprintln!("{prefix}{} — 打开失败：{e:#}", rel.display()));
@@ -216,6 +285,7 @@ fn run_batch(args: &Args, root: &Path, kind: &str, key_table: Option<&KeyTable>)
         total_failures += summary.errors.len();
         total_bytes += summary.bytes;
         total_lua += summary.lua_ok;
+        all_lua.append(&mut summary.lua_files);
     }
     pb.finish_and_clear();
     println!(
@@ -226,7 +296,7 @@ fn run_batch(args: &Args, root: &Path, kind: &str, key_table: Option<&KeyTable>)
         total_lua,
         total_failures
     );
-    Ok(total_failures + skipped)
+    Ok((total_failures + skipped, all_lua))
 }
 
 // ---------- 公共流程 ----------
@@ -378,6 +448,8 @@ struct PackageSummary {
     lua_fallback: usize,
     bytes: u64,
     errors: Vec<(String, String)>,
+    /// 解密成功并已写出字节码的 .lua 文件（供 --decompile 二次反编译）。
+    lua_files: Vec<PathBuf>,
 }
 
 fn extract_all(
@@ -422,6 +494,7 @@ fn extract_all(
         lua_fallback: 0,
         bytes: 0,
         errors: Vec::new(),
+        lua_files: Vec::new(),
     };
     for (name, r) in results {
         match r {
@@ -429,10 +502,11 @@ fn extract_all(
                 s.ok += 1;
                 s.bytes += n;
             }
-            Ok(Outcome::Lua(n)) => {
+            Ok(Outcome::Lua(n, path)) => {
                 s.ok += 1;
                 s.bytes += n;
                 s.lua_ok += 1;
+                s.lua_files.push(path);
             }
             Ok(Outcome::LuaFallbackRaw) => {
                 s.ok += 1;
@@ -471,8 +545,8 @@ fn print_errors(s: &PackageSummary) {
 enum Outcome {
     /// 写出字节数（普通条目）。
     Plain(u64),
-    /// 写出字节数（Lua 条目且解密成功）。
-    Lua(u64),
+    /// 写出字节数与文件路径（Lua 条目且解密成功）。
+    Lua(u64, PathBuf),
     /// Lua 条目但解密失败，回退写原始数据。
     LuaFallbackRaw,
 }
@@ -521,7 +595,7 @@ fn extract_entry(
             Ok(dec) => {
                 let n = dec.len() as u64;
                 data = dec;
-                Outcome::Lua(n)
+                Outcome::Lua(n, dest.clone())
             }
             // 解密失败不实时打印（会打断进度条重绘），计入汇总统一报告。
             Err(_) => Outcome::LuaFallbackRaw,
@@ -543,5 +617,66 @@ fn truncate(s: &str, n: usize) -> String {
     } else {
         let t: String = s.chars().take(n).collect();
         format!("{t}…")
+    }
+}
+
+// ---------- Lua 反编译（--decompile）----------
+
+/// 并行调用 unluac 把解密后的字节码覆写为源码。
+/// unluac 一次只接受一个文件且 JVM 启动占大头，故用小线程池并发
+/// （上限 8，避免同时拉起过多 JVM）。失败的单个文件保留字节码并计数。
+fn decompile_all(files: &[PathBuf], dec: &Decompiler) -> Result<()> {
+    if files.is_empty() {
+        println!("没有可反编译的 Lua 文件");
+        return Ok(());
+    }
+    let threads = rayon::current_num_threads().min(8);
+    println!(
+        "
+反编译：{} 个 Lua 文件（unluac，{} 并发）",
+        files.len(),
+        threads
+    );
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .context("创建反编译线程池失败")?;
+    let pb = new_progress_bar(files.len() as u64);
+    let results: Vec<bool> = pool.install(|| {
+        files
+            .par_iter()
+            .map(|f| {
+                let ok = decompile_one(f, dec);
+                if ok {
+                    pb.set_message(truncate(&f.to_string_lossy(), 48));
+                }
+                pb.inc(1);
+                ok
+            })
+            .collect()
+    });
+    pb.finish_and_clear();
+    let ok = results.iter().filter(|r| **r).count();
+    let fail = files.len() - ok;
+    println!("反编译完成：{ok}/{} 成功", files.len());
+    if fail > 0 {
+        println!("警告：{fail} 个文件反编译失败，已保留解密后的字节码（可自行用 unluac/luadec 处理）");
+    }
+    Ok(())
+}
+
+/// 反编译单个文件：成功则用 stdout 覆写原文件，返回是否成功。
+fn decompile_one(path: &Path, dec: &Decompiler) -> bool {
+    let output = std::process::Command::new("java")
+        .arg("-jar")
+        .arg(&dec.jar)
+        .arg(path)
+        .stderr(std::process::Stdio::null())
+        .output();
+    match output {
+        Ok(out) if out.status.success() && !out.stdout.is_empty() => {
+            std::fs::write(path, &out.stdout).is_ok()
+        }
+        _ => false,
     }
 }

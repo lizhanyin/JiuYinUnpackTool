@@ -1,8 +1,7 @@
 //! 启动器密钥提取集成测试。
 
 use jiuyin_unpack::key::{
-    extract_key, find_sub, is_printable, longest_printable_run, parse_key_table,
-    KEY_SIGNATURE,
+    extract_key, find_sub, is_printable, longest_printable_run, KEY_SIGNATURE,
 };
 use jiuyin_unpack::key;
 use std::path::PathBuf;

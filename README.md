@@ -30,6 +30,10 @@ jiuyin-unpack --all-patches <游戏安装目录> [OPTIONS]
                           ../updater/fxupdate.exe → ../bin64/fxgame.exe）
       --keys <FILE>      索引加密格式（标志 4）的密钥表，每行 "ID=hex"
                          （默认探测 exe 目录 / 当前目录下的 jiuyin-keys.txt）
+      --decompile        反编译解密后的 Lua 字节码为源码（需 PATH 中有 java，
+                         以及 unluac.jar；逐文件调用，8 并发，失败的保留字节码）
+      --unluac <FILE>    unluac.jar 路径（默认探测 exe 目录 / 当前目录 /
+                         tools/unluac/ 下的 unluac.jar）
       --list             仅列出条目（路径、压缩/原始大小、时间戳、目标包名）
       --no-lua-decrypt   跳过 Lua 字节码解密，写出原始数据
   -j, --jobs <N>         并行线程数（默认：运行时逻辑 CPU 核数，自动适配；
@@ -56,6 +60,10 @@ jiuyin-unpack --all-patches "D:\游戏蜗牛\9yinjh\patch" -o D:\out\patches
 
 # 指定另一个密钥来源
 jiuyin-unpack "D:\游戏蜗牛\9yinjh\updater_\updater_lua.package" -l "D:\游戏蜗牛\9yinjh\bin64\fxgame.exe" -o D:\out\ulua
+
+# 解包并把 Lua 字节码反编译成可读源码（包内 .lua 是编译产物而非源码）
+jiuyin-unpack "D:\游戏蜗牛\9yinjh\res\lua.package" --keys jiuyin-keys.txt \
+    --decompile --unluac unluac.jar -o D:\out\lua_src
 ```
 
 `.patch` 条目携带目标包名（如 `res\share.package`），输出组织为

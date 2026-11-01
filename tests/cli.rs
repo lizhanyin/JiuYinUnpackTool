@@ -62,6 +62,8 @@ fn mode_validation() {
         keys: None,
         list: false,
         no_lua_decrypt: false,
+        decompile: false,
+        unluac: None,
         jobs: None,
     };
     assert!(validate_modes(&args).is_err());
@@ -75,4 +77,23 @@ fn mode_validation() {
     assert!(validate_modes(&args).is_ok());
     args.output = Some(PathBuf::from("out"));
     assert!(validate_modes(&args).is_ok()); // 双批量共用 -o 无冲突（输出按相对路径区分）
+}
+
+#[test]
+fn decompile_conflicts_with_no_lua_decrypt() {
+    let args = Args {
+        package: Some("x.package".into()),
+        all_packages: None,
+        all_patches: None,
+        output: None,
+        launcher: None,
+        keys: None,
+        list: false,
+        no_lua_decrypt: true,
+        decompile: true,
+        unluac: None,
+        jobs: None,
+    };
+    let err = validate_modes(&args).unwrap_err().to_string();
+    assert!(err.contains("互斥"), "实际错误：{err}");
 }
